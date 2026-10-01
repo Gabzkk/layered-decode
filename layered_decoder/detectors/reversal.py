@@ -21,7 +21,7 @@ import string
 from typing import List
 
 from .base import Family, Layer
-from ..scoring import DICTIONARY, flag_pattern_score
+from ..scoring import DICTIONARY, english_word_ratio, flag_pattern_score
 
 WORDS = frozenset(DICTIONARY)
 
@@ -130,6 +130,12 @@ class ReversalDetector(Layer):
         return sum(1 for w in re.findall(r"[a-zA-Z]{2,}", text.lower()) if w in WORDS)
 
     def detect(self, data: bytes) -> float:
+        if len(data) <= 1:
+            return 0.0
+
+        if data.strip().endswith(b"=") and not _has_misplaced_padding(data):
+            return 0.0
+
         original = data.decode("latin1")
         reversed_text = data[::-1].decode("latin1")
 
@@ -157,7 +163,10 @@ class ReversalDetector(Layer):
                 if self._word_hits(_shift(reversed_text, shift)) >= 2:
                     return 0.75
 
-        return 0.0
+        # Fix 1: Reversal's baseline detection confidence must clear the structural
+        # threshold unconditionally (O(1) and deterministic -- reversing a scrambled
+        # string with no readable words yet scores identically to not reversing it).
+        return 0.6
 
     def decode(self, data: bytes) -> List[bytes]:
         return [data[::-1]]

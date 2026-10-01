@@ -24,12 +24,19 @@ from .scoring import (
     english_word_ratio,
     flag_content_score,
     flag_pattern_score,
+    is_verified_strict_flag,
     looks_structured,
     score,
     shannon_entropy,
 )
 from .detectors import Layer, StopSignal, get_all_detectors
 from .detectors.xor import STATISTICAL_CONFIDENCE
+
+# Layers that are their own inverses. Guard against immediate re-application.
+INVOLUTIONS = frozenset({"Reversal", "ROT13"})
+
+# Cap on candidates that receive the expensive statistical search pass each round.
+STATISTICAL_CANDIDATE_CAP = 3
 
 # A candidate must clear this to enter the beam. Guards against a statistical
 # layer's 255-key spray drowning out structural signal.
@@ -64,7 +71,7 @@ MAX_SLOTS_PER_LAYER = 1
 #
 # This is a precedence rule between families, not a hardcoded decode order --
 # the search still discovers ordering within each family.
-STRONG_STRUCTURAL_CONFIDENCE = STATISTICAL_CONFIDENCE
+STRONG_STRUCTURAL_CONFIDENCE = 0.80
 
 # Termination bands. Calibrated against this scorer's actual distribution --
 # see tests/test_beam_search.py::test_score_thresholds_match_distribution.
@@ -279,6 +286,8 @@ class LayeredDecoder:
         best = root
         frontier: List[_State] = [root]
         saw_crypto = False
+        expanded_structural: Set[bytes] = set()
+        expanded_statistical: Set[bytes] = set()
 
         # Already-decoded input is the answer. Without this, the beam keeps
         # hunting and will happily mangle clean prose: "Just plain text here"
@@ -289,61 +298,113 @@ class LayeredDecoder:
             return self._build_result(root, data, saw_crypto=False)
 
         for depth in range(1, self.max_depth + 1):
-            candidates: List[_State] = []
-            expanded: set = set()
             any_progress = False
 
+            if forced_layers.get(depth) is not None:
+                candidates: List[_State] = []
+                for node in frontier:
+                    candidates.extend(self._expand(node, depth, forced_layers, guarded=False, family=None))
+                if not candidates:
+                    break
+                frontier = self._select_diverse(candidates)
+                frontier.sort(key=lambda s: s.rank, reverse=True)
+                if frontier and frontier[0].rank > best.rank:
+                    best = frontier[0]
+                continue
+
+            protected: List[_State] = []
+            statistical_candidates: List[_State] = []
+
+            # Structural pass on all candidates in frontier
             for node in frontier:
+                if node.data in expanded_structural:
+                    continue
+                expanded_structural.add(node.data)
                 guarded = self._tripped_stop_signal(node.data)
                 if guarded:
                     saw_crypto = True
-                if node.data in expanded:
-                    continue
-                expanded.add(node.data)
-                new_states = self._expand(node, depth, forced_layers, guarded=guarded)
-                for state in new_states:
+                new_structural = self._expand(node, depth, forced_layers, guarded=guarded, family="structural")
+                for state in new_structural:
                     if state.rank > node.rank or (
                         state.steps
                         and not state.steps[-1].statistical
                         and state.steps[-1].confidence >= STRONG_STRUCTURAL_CONFIDENCE
                     ):
                         any_progress = True
-                candidates.extend(new_states)
+                protected.extend(new_structural)
 
-            if not candidates:
+            # Fix 3: Determine candidates for statistical pass:
+            # Structural nodes (including root and low-scoring waypoints like pre-XOR binary)
+            # plus top-scoring nodes in frontier up to candidate cap.
+            stat_nodes = []
+            for n in frontier:
+                if not n.steps or not n.steps[-1].statistical:
+                    stat_nodes.append(n)
+            for n in frontier:
+                if len(stat_nodes) >= max(STATISTICAL_CANDIDATE_CAP, self.beam_width):
+                    break
+                if n not in stat_nodes:
+                    stat_nodes.append(n)
+
+            for node in stat_nodes:
+                if node.data in expanded_statistical:
+                    continue
+                expanded_statistical.add(node.data)
+                guarded = self._tripped_stop_signal(node.data)
+                if guarded:
+                    saw_crypto = True
+                new_statistical = self._expand(node, depth, forced_layers, guarded=guarded, family="statistical")
+                for state in new_statistical:
+                    if state.rank > node.rank:
+                        any_progress = True
+                statistical_candidates.extend(new_statistical)
+
+            # Fix 2:
+            # protected: outputs of structural layers -- exempt from score-based pruning
+            # (cap at beam_width * 3 as safety valve against unbounded growth)
+            if len(protected) > self.beam_width * 3:
+                protected.sort(key=lambda s: s.rank, reverse=True)
+                protected = protected[: self.beam_width * 3]
+
+            # scored_pool: statistical layer outputs + the parent candidates -- ranked and pruned to beam_width
+            scored_pool_candidates = statistical_candidates + list(frontier)
+            scored_pool_candidates.sort(key=lambda s: s.rank, reverse=True)
+            scored_pool = self._select_diverse(scored_pool_candidates)
+
+            # Final frontier = dedup(protected + scored_pool)
+            seen: Dict[bytes, _State] = {}
+            for state in protected + scored_pool:
+                if state.data not in seen or state.rank > seen[state.data].rank:
+                    seen[state.data] = state
+
+            frontier = list(seen.values())
+            # Fix 4: Frontier must be sorted after merging pools
+            frontier.sort(key=lambda s: s.rank, reverse=True)
+
+            if not frontier:
                 break
 
-            for candidate in candidates:
+            for candidate in frontier:
                 if not candidate.n_statistical and identify_key_requirement(candidate.data):
                     return self._build_result(candidate, data, saw_crypto=True)
 
-            candidates.sort(key=lambda s: s.rank, reverse=True)
-            frontier = self._select_diverse(candidates)
-
-            # Relative acceptance: a new best must clear the incumbent by a real
-            # margin, not by noise. Without this a +0.06 step is treated like a
-            # +0.40 one and the reported answer creeps through a dead end.
-            #
-            # The exception matters: while the incumbent is not a finished
-            # destination, a marginal step toward one is still progress, so the
-            # climb is allowed to continue. Freezing mid-climb would strand
-            # chains that only pay off several steps later -- exactly what beam
-            # search exists to allow.
             challenger = frontier[0]
             is_better = challenger.rank > best.rank and (
                 not _is_finished(best.data, self.flag_prefixes)
                 or challenger.rank >= best.rank + MIN_BEST_IMPROVEMENT
             )
-            # A confident structural peel of an unpeeled input is progress even
-            # if the character distribution of the wrapper drifts slightly.
-            if not is_better and best is root and challenger.steps:
-                first_step = challenger.steps[0]
-                if (
-                    not first_step.statistical
-                    and first_step.confidence >= STRONG_STRUCTURAL_CONFIDENCE
-                    and challenger.rank >= best.rank - 0.05
-                ):
-                    is_better = True
+            if not is_better and best is root:
+                for c in frontier:
+                    if c.steps:
+                        first_step = c.steps[0]
+                        if (
+                            not first_step.statistical
+                            and first_step.confidence >= STRONG_STRUCTURAL_CONFIDENCE
+                            and c.rank >= best.rank - 0.05
+                        ):
+                            challenger = c
+                            is_better = True
+                            break
 
             if is_better:
                 best = challenger
@@ -351,7 +412,7 @@ class LayeredDecoder:
             if best.rank >= SOLVED_SCORE and _is_finished(best.data, self.flag_prefixes):
                 break
 
-            if not any_progress and depth > 1:
+            if not any_progress and depth > 1 and not protected:
                 break
 
         return self._build_result(best, data, saw_crypto)
@@ -399,6 +460,7 @@ class LayeredDecoder:
         depth: int,
         forced_layers: Dict[int, str],
         guarded: bool = False,
+        family: Optional[str] = None,
     ) -> List[_State]:
         forced_name = forced_layers.get(depth)
         if forced_name is not None:
@@ -408,62 +470,48 @@ class LayeredDecoder:
             if target is None:
                 return []
             layers: List[Layer] = [target]
-        elif guarded:
-            # A stop signal fired. Every layer still runs: the guard governs the
-            # *verdict*, not which layers are available. Restricting a guarded node
-            # to family B looks harmless but is not -- it silently removes the
-            # structural layers, so any node that trips the guard *and* is still
-            # structurally decodable becomes a dead end and the search cannot
-            # continue past the step that would have progressed. Structural layers
-            # are cheap and rarely fire on ciphertext, so excluding them buys
-            # nothing. The non-goal still holds, because the guard still governs
-            # the reported verdict below.
-            layers = self.decode_layers
+        elif family == "structural":
+            layers = [l for l in self.decode_layers if not l.family.is_statistical]
+        elif family == "statistical":
+            layers = [l for l in self.decode_layers if l.family.is_statistical]
         else:
             layers = self.decode_layers
 
         out: List[_State] = []
         structural_hit = self._strong_structural_match(node.data)
-        # A flag-shaped cipher still needs a keyed transform. Heuristic noise
-        # removal must not suppress it just because deleting letters finds a word.
-        try:
-            unresolved_flag = flag_content_score(node.data.decode("utf-8"), self.flag_prefixes) == 0.25
-        except UnicodeDecodeError:
-            unresolved_flag = False
         wrapper_only_unscorable = False
         if structural_hit:
             strong_structural = [
-                layer
-                for layer in self.decode_layers
-                if (not layer.family.is_statistical)
-                and layer.detect(node.data) >= STRONG_STRUCTURAL_CONFIDENCE
+                l
+                for l in self.decode_layers
+                if (not l.family.is_statistical)
+                and l.detect(node.data) >= STRONG_STRUCTURAL_CONFIDENCE
             ]
             wrapper_only_unscorable = bool(strong_structural) and all(
-                layer.name in ("Base64", "Base64Url", "Hex")
+                l.name in ("Base64", "Base64Url", "Hex")
                 and all(
                     cached_score(out_bytes, self.flag_prefixes) < MIN_CANDIDATE_SCORE
-                    for out_bytes in layer.decode(node.data)
+                    for out_bytes in l.decode(node.data)
                 )
-                for layer in strong_structural
+                for l in strong_structural
             )
 
         for layer in layers:
             if forced_name is None and layer.detect(node.data) < self.min_confidence:
                 continue
-            if (
-                forced_name is None
-                and node.layer_names
-                and node.layer_names[-1] == layer.name
-                and layer.name in ("Caesar", "XorSingleByte", "RepeatingKeyXor", "Vigenere", "Reversal")
-            ):
-                continue
-            # A visible structural match outranks brute force. See
-            # STRONG_STRUCTURAL_CONFIDENCE.
+            # Fix 1: Guard against immediate re-application of involutions or repeated statistical layers
+            if forced_name is None and node.layer_names:
+                last_layer = node.layer_names[-1]
+                if layer.name in INVOLUTIONS and last_layer == layer.name:
+                    continue
+                if layer.family.is_statistical and layer.name in node.layer_names:
+                    continue
+            # Strong structural match preempts brute force on wrapper text,
+            # except Caesar when the wrapper decodes to unscorable binary (Caesar-shifted Base64).
             if (
                 forced_name is None
                 and layer.family.is_statistical
                 and structural_hit
-                and not unresolved_flag
                 and not (wrapper_only_unscorable and layer.name == "Caesar")
             ):
                 continue
@@ -654,12 +702,13 @@ def _is_finished(data: bytes, flag_prefixes: Tuple[str, ...] = DEFAULT_FLAG_PREF
     if not all(c.isprintable() or c in "\n\r\t" for c in text):
         return False
 
-    if flag_pattern_score(text) > 0 or flag_content_score(text, flag_prefixes) == 1.0:
+    if is_verified_strict_flag(text, flag_prefixes):
         alnum = sum(1 for c in text if c.isalnum())
-        return (
-            flag_content_score(text, flag_prefixes) == 1.0
-            and alnum / len(text) >= FLAG_ALNUM_RATIO
-        )
+        return alnum / len(text) >= FLAG_ALNUM_RATIO
+
+    if flag_content_score(text, flag_prefixes) == 1.0:
+        alnum = sum(1 for c in text if c.isalnum())
+        return alnum / len(text) >= FLAG_ALNUM_RATIO
 
     tokens = [t for t in text.split() if t]
     if not tokens:

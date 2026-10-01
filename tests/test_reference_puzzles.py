@@ -50,6 +50,17 @@ class TestReferencePuzzles(unittest.TestCase):
         self.assertEqual(result.status, "solved")
         self.assertEqual(result.steps, [])
 
+    def test_repeating_key_xor_chain(self):
+        payload = (
+            "hFzY1QDMxAzM1cDM0ADMzIGMiVDN1QWM4MTZwgzMjVDNwEDMzUjYxQTMlVzMwAzMwATMwY"
+            "TNyATYwUGMmBDMzQTN3AzMxAzM0EzY1ETMlVDMwAzMzEzNxQTNiFTNxMWNmBjZxYTNjBDO"
+            "zQWM0UDOwkDMmVjYwQTMwIjY1YmM"
+        )
+        result = LayeredDecoder().decode(payload)
+        self.assertEqual(result.final_bytes, b"H4G{l0ng3r_c1ph3rt3xt_g1v3s_th3_hamm1ng_d1st4nc3_a_r34l_ch4nc3}")
+        self.assertEqual(result.status, "solved")
+        self.assertEqual(result.layers_detected, ["Reversal", "Base64", "Hex", "RepeatingKeyXor"])
+
 
 if __name__ == "__main__":
     unittest.main()

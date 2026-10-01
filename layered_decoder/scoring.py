@@ -161,24 +161,21 @@ def bigram_structure(text: str) -> float:
 # spurious hit outranks any amount of clean English -- and the beam is a
 # maximisation search, so it will happily walk into one. Measured false-positive
 # rate on printable XOR garbage: 4.65% -> 0.00%.
-FLAG_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9_\-])"          # left delimiter
-    r"[A-Za-z][A-Za-z0-9_]{1,15}"   # prefix
-    r"\{[A-Za-z0-9_\-]{3,64}\}"     # body
-    r"(?![A-Za-z0-9_\-])"           # right delimiter
-)
+STRICT_FLAG_PATTERN = re.compile(r"^([A-Za-z0-9_]{1,20}\{[A-Za-z0-9_\-]{1,200}\}\s*)+$")
+LOOSE_FLAG_PATTERN = re.compile(r"[A-Za-z0-9_]{1,20}\{[A-Za-z0-9_\-]{1,200}\}")
+FLAG_PATTERN = LOOSE_FLAG_PATTERN
 _KNOWN_FLAG_BODY = re.compile(r"[A-Za-z0-9_\-]+\}(?![A-Za-z0-9_\-])")
 
 
 def flag_pattern_score(text: str) -> float:
     """1.0 if the text contains something shaped like a CTF flag."""
-    return 1.0 if FLAG_PATTERN.search(text) else 0.0
+    return 1.0 if LOOSE_FLAG_PATTERN.search(text) else 0.0
 
 
 def has_known_flag_prefix(text: str, flag_prefixes: tuple[str, ...]) -> bool:
     return any(
         prefix and text.startswith(prefix)
-        and (_KNOWN_FLAG_BODY.match(text, len(prefix)) if prefix.endswith("{") else FLAG_PATTERN.match(text))
+        and (_KNOWN_FLAG_BODY.match(text, len(prefix)) if prefix.endswith("{") else LOOSE_FLAG_PATTERN.match(text))
         for prefix in flag_prefixes
     )
 
@@ -186,19 +183,66 @@ def has_known_flag_prefix(text: str, flag_prefixes: tuple[str, ...]) -> bool:
 _LEET_LETTERS = str.maketrans("013457", "oieast")
 
 
-def flag_content_score(text: str, flag_prefixes: tuple[str, ...] = DEFAULT_FLAG_PREFIXES) -> float:
-    """Flag shape alone is weak evidence: ROT13 preserves braces and separators."""
-    if has_known_flag_prefix(text, flag_prefixes):
-        return 1.0
-    matches = list(FLAG_PATTERN.finditer(text))
+def _caesar_shift_text(text: str, shift: int) -> str:
+    out = []
+    for c in text:
+        if "a" <= c <= "z":
+            out.append(chr((ord(c) - 97 + shift) % 26 + 97))
+        elif "A" <= c <= "Z":
+            out.append(chr((ord(c) - 65 + shift) % 26 + 65))
+        else:
+            out.append(c)
+    return "".join(out)
+
+
+def _body_word_score(text: str) -> float:
+    matches = LOOSE_FLAG_PATTERN.findall(text)
     if not matches:
         return 0.0
+    total_words = 0
+    total_hits = 0
     for match in matches:
-        body = match.group().split("{", 1)[1][:-1].lower().translate(_LEET_LETTERS)
-        words = re.split(r"[_-]+", body)
-        if sum(word in DICTIONARY for word in words) / len(words) >= 0.4:
-            return 1.0
-    return 0.25
+        parts = match.split("{", 1)
+        if len(parts) < 2:
+            continue
+        body = parts[1].rstrip("}")
+        words = [w for w in re.split(r"[_\-]+", body.lower()) if w]
+        if not words:
+            continue
+        total_words += len(words)
+        leet_body = body.lower().translate(_LEET_LETTERS)
+        leet_words = [w for w in re.split(r"[_\-]+", leet_body) if w]
+        for w, lw in zip(words, leet_words):
+            if w in DICTIONARY or lw in DICTIONARY:
+                total_hits += 1
+    return total_hits / total_words if total_words > 0 else 0.0
+
+
+def is_verified_strict_flag(text: str, flag_prefixes: tuple[str, ...] = DEFAULT_FLAG_PREFIXES) -> bool:
+    """Verify that a strict flag candidate is not a Caesar or ROT13 shifted decoy."""
+    stripped = text.strip()
+    if not STRICT_FLAG_PATTERN.match(stripped):
+        return False
+    base_score = max(english_word_ratio(stripped), _body_word_score(stripped))
+    if base_score <= 0.0 and not has_known_flag_prefix(stripped, flag_prefixes):
+        return False
+    for shift in range(1, 26):
+        shifted = _caesar_shift_text(stripped, shift)
+        shifted_score = max(english_word_ratio(shifted), _body_word_score(shifted))
+        if shifted_score > base_score + 0.05:
+            return False
+    return True
+
+
+def flag_content_score(text: str, flag_prefixes: tuple[str, ...] = DEFAULT_FLAG_PREFIXES) -> float:
+    """Two-tier flag scoring: verified strict gets full bonus, loose gets small bonus."""
+    if is_verified_strict_flag(text, flag_prefixes):
+        return 1.0
+    if has_known_flag_prefix(text, flag_prefixes):
+        return 0.75
+    if LOOSE_FLAG_PATTERN.search(text):
+        return 0.25
+    return 0.0
 
 
 def has_known_patterns(text: str) -> List[str]:

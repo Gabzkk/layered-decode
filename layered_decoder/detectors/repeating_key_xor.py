@@ -9,7 +9,8 @@ from .base import CandidateEvidence, Family, Layer
 from .xor import STATISTICAL_CONFIDENCE
 from ..scoring import DEFAULT_FLAG_PREFIXES, score
 
-MAX_COMBINATIONS = 10_000
+MAX_COMBINATIONS = 20_000
+MAX_KEYLEN = 6
 BOUNDED_COMBINATIONS = 256
 KEY_LENGTH_CANDIDATES = 5
 
@@ -28,9 +29,9 @@ def hamming_distance(left: bytes, right: bytes) -> int:
     return sum((a ^ b).bit_count() for a, b in zip(left, right))
 
 
-def rank_key_lengths(data: bytes) -> list[tuple[float, int]]:
+def rank_key_lengths(data: bytes, max_keylen: int = 20) -> list[tuple[float, int]]:
     ranked = []
-    for length in range(2, min(20, len(data) // 4) + 1):
+    for length in range(2, min(max_keylen, len(data) // 4) + 1):
         blocks = [data[i:i + length] for i in range(0, min(len(data) // length, 8) * length, length)]
         distances = [hamming_distance(a, b) / length for a, b in combinations(blocks, 2)]
         ranked.append((sum(distances) / len(distances), length))
@@ -95,6 +96,7 @@ class RepeatingKeyXorLayer(Layer):
     name = "RepeatingKeyXor"
     priority = 82
     family = Family.STATISTICAL
+    MAX_KEYLEN = MAX_KEYLEN
 
     def __init__(self, flag_prefixes: tuple[str, ...] = DEFAULT_FLAG_PREFIXES):
         self.flag_prefixes = tuple(flag_prefixes)
@@ -106,7 +108,7 @@ class RepeatingKeyXorLayer(Layer):
         survivors = []
         # Eliminate across the ranked list before frequency scoring; impossible
         # lengths must not consume the five candidate slots on short inputs.
-        for _, length in rank_key_lengths(data):
+        for _, length in rank_key_lengths(data, max_keylen=self.MAX_KEYLEN):
             columns = [data[i::length] for i in range(length)]
             keys = [printable_keys(column) for column in columns]
             if all(keys):
