@@ -100,6 +100,10 @@ python layered_decoder sample_chal.txt
 | `--beam-width` | | Search beam width (default: `3`). | `--beam-width 5` |
 | `--flag-prefix` | | Add an exact flag prefix at the start (e.g. `'H4G{'`, repeatable). | `--flag-prefix 'H4G{'` |
 | `--try-branches` | | Evaluates parallel split/recombination strategies (odd/even, half split). | `--try-branches -f stream.txt` |
+| `--key` | `-k` | Decryption key or password for encrypted envelopes (Fernet / OpenSSL salted). | `python layered_decoder -k "secret" payload.txt` |
+| `--wordlist` | `-w` | Wordlist file for brute-forcing encryption keys/passwords. | `python layered_decoder -w rockyou.txt payload.txt` |
+| `--bruteforce` | `-B` | Automatically brute-force encrypted envelopes with built-in dictionary. | `python layered_decoder -B payload.txt` |
+| `--no-prompt` | | Disable interactive terminal prompt when a key is required. | `python layered_decoder --no-prompt payload.txt` |
 | `--verbose` | `-v` | Emits intermediate inputs, outputs, scores, and confidence at every step. | `python layered_decoder -v sample_chal.txt` |
 | `--quiet` | `-q` | Emits **only** the final output string (ideal for UNIX pipelines). | `python layered_decoder -q sample_chal.txt` |
 | `--json` | | Formats execution trace, layers, steps, and reasons as structured JSON. | `python layered_decoder --json sample_chal.txt \| jq` |
@@ -486,12 +490,80 @@ is**; `stopped_reason` says **why the search stopped looking**.
 | `final_bytes_hex` | hex string | The lossless result. `final_output` is a display render; use this for any further processing. |
 
 
-## Check whether a decryption key is required
+## 8. Cryptographic Envelope Decryption & Brute-Forcing
 
-```bash
-layered-decoder --json -i "<encoded payload>"
+The engine identifies standard cryptographic envelopes (**Fernet** and **OpenSSL salted**) by header structure and layout, halting further blind exploration to report the exact requirements. It can then interactively prompt for a key, accept keys via CLI / API, or automatically brute-force passwords.
+
+### Interactive Decryption Prompting
+When executing in an interactive terminal and an encrypted envelope is reached, the CLI halts and prompts:
+
+```text
+[Layer 1] Detected: Base64 (confidence: 0.90)
+  Output: Salted__...
+
+Decryption key required: OpenSSL salted
+Evidence: Salted__ magic header followed by salt/payload bytes...
+Needed: Original password plus cipher, key derivation method, digest...
+
+[?] Decryption key/password required for OpenSSL salted.
+    Enter key/password (or 'b' to brute-force, Enter to skip): 
 ```
 
-Recognized OpenSSL salted or Fernet payloads report `key_required: true`,
-`status: "key_required"`, format evidence, and the required decryption information.
-Unknown high-entropy data remains uncertain. No key input is needed for analysis.
+- **Enter password/key**: Decrypts the envelope with the supplied secret and seamlessly resumes peeling inner layers (e.g. `Caesar`, `Base64`, `Gzip`).
+- **Enter `b` or `bruteforce`**: Automatically runs dictionary brute-forcing against common passwords.
+- **Enter empty / skip**: Exits cleanly with diagnostic report.
+
+---
+
+### Command-Line Flag Recipes
+
+#### 1. Supplying a Known Key or Passphrase
+```bash
+# Decrypt Fernet or OpenSSL envelope with password
+python layered_decoder -k "supersecret" payload.txt
+
+# Extract only the peeled final flag in quiet mode
+python layered_decoder -q -k "supersecret" payload.txt
+```
+
+#### 2. Automated Dictionary Brute-Forcing
+```bash
+# Brute-force using the built-in CTF & common passwords dictionary
+python layered_decoder -B payload.txt
+
+# Quiet mode: crack and print only the resulting plaintext
+python layered_decoder -q -B payload.txt
+```
+
+#### 3. Custom Wordlist Brute-Forcing
+```bash
+# Brute-force using a custom wordlist file (e.g. rockyou.txt)
+python layered_decoder -w /usr/share/wordlists/rockyou.txt payload.txt
+```
+
+#### 4. JSON Output with Decrypted Continuation
+```bash
+# Output full execution trace including decryption step as JSON
+python layered_decoder --json -k "dragon" payload.txt | jq
+```
+
+---
+
+### Programmatic Python API
+
+```python
+from layered_decoder import LayeredDecoder
+
+decoder = LayeredDecoder()
+
+# 1. Supply key directly
+result = decoder.decode(payload, key="masterkey")
+print("Output:", result.final_output)
+
+# 2. Automatically brute-force with built-in dictionary
+result = decoder.decode(payload, bruteforce=True)
+print("Cracked output:", result.final_output)
+
+# 3. Supply a custom wordlist
+result = decoder.decode(payload, wordlist=["cand1", "cand2", "secret_pass"])
+```

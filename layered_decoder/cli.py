@@ -151,6 +151,19 @@ def main() -> None:
         "--flag-prefix", action="append", default=[], metavar="PREFIX",
         help="Add an exact flag prefix at the start, e.g. 'H4G{' (repeatable)",
     )
+    parser.add_argument("-k", "--key", help="Decryption key or password for encrypted envelopes")
+    parser.add_argument(
+        "-w", "--wordlist",
+        help="Path to wordlist file for brute-forcing encrypted envelopes",
+    )
+    parser.add_argument(
+        "-B", "--bruteforce", action="store_true",
+        help="Attempt dictionary brute-force for encrypted envelopes",
+    )
+    parser.add_argument(
+        "--no-prompt", action="store_true",
+        help="Do not prompt interactively for decryption key",
+    )
     parser.add_argument("--json", action="store_true", dest="json_output", help="Output as JSON")
     parser.add_argument("-v", "--verbose", action="store_true", help="Show intermediate input values")
     parser.add_argument("-q", "--quiet", action="store_true", help="Only print the final decoded output")
@@ -184,6 +197,9 @@ def main() -> None:
         max_depth=args.max_depth,
         beam_width=args.beam_width,
         flag_prefixes=tuple(args.flag_prefix),
+        key=args.key,
+        wordlist=args.wordlist,
+        bruteforce=args.bruteforce,
     )
 
     # ── process targets ────────────────────────────────────────────
@@ -194,6 +210,78 @@ def main() -> None:
         else:
             res = decoder.decode(payload, forced_layers=forced_layers or None)
         results.append((label, res))
+
+    # ── interactive decryption prompt if key required ──────────────
+    interactive = (
+        not args.key
+        and not args.bruteforce
+        and not args.no_prompt
+        and not args.json_output
+        and not args.quiet
+        and sys.stdin.isatty()
+    )
+    already_printed: set[int] = set()
+
+    if interactive:
+        for idx, (label, res) in enumerate(results):
+            if res.key_required:
+                _print_result(res, label=label if len(results) > 1 else None, verbose=args.verbose)
+                fmt = res.encryption_format or "encrypted envelope"
+                print(f"[?] Decryption key/password required for {fmt}.")
+                try:
+                    user_input = input("    Enter key/password (or 'b' to brute-force, Enter to skip): ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    user_input = ""
+
+                payload = targets[idx][1]
+                if user_input.lower() in ("b", "brute", "bruteforce"):
+                    print("[*] Running dictionary brute-force...")
+                    new_res = decoder.decode(
+                        payload,
+                        forced_layers=forced_layers or None,
+                        bruteforce=True,
+                        wordlist=args.wordlist,
+                    )
+                    if not new_res.key_required:
+                        print("[+] Envelope cracked and decrypted successfully!\n")
+                        results[idx] = (label, new_res)
+                        _print_result(new_res, label=label if len(results) > 1 else None, verbose=args.verbose)
+                    else:
+                        print("[-] Brute-force exhausted without finding a valid key.\n")
+                    already_printed.add(idx)
+
+                elif user_input:
+                    print("[*] Attempting decryption with provided key...")
+                    new_res = decoder.decode(
+                        payload,
+                        forced_layers=forced_layers or None,
+                        key=user_input,
+                    )
+                    if not new_res.key_required:
+                        print("[+] Decrypted successfully! Resuming decoding...\n")
+                        results[idx] = (label, new_res)
+                        _print_result(new_res, label=label if len(results) > 1 else None, verbose=args.verbose)
+                    else:
+                        print("[-] Decryption failed: invalid key or authentication error.")
+                        try:
+                            retry = input("[?] Would you like to attempt dictionary brute-force? [y/N]: ").strip().lower()
+                        except (EOFError, KeyboardInterrupt):
+                            retry = ""
+                        if retry == "y":
+                            print("[*] Running dictionary brute-force...")
+                            new_res = decoder.decode(
+                                payload,
+                                forced_layers=forced_layers or None,
+                                bruteforce=True,
+                                wordlist=args.wordlist,
+                            )
+                            if not new_res.key_required:
+                                print("[+] Envelope cracked and decrypted successfully!\n")
+                                results[idx] = (label, new_res)
+                                _print_result(new_res, label=label if len(results) > 1 else None, verbose=args.verbose)
+                            else:
+                                print("[-] Brute-force exhausted without finding a valid key.\n")
+                    already_printed.add(idx)
 
     # ── format output ──────────────────────────────────────────────
     if args.json_output:
@@ -216,8 +304,9 @@ def main() -> None:
         return
 
     # Standard human-readable output
-    for label, res in results:
-        _print_result(res, label=label if len(results) > 1 else None, verbose=args.verbose)
+    for idx, (label, res) in enumerate(results):
+        if idx not in already_printed:
+            _print_result(res, label=label if len(results) > 1 else None, verbose=args.verbose)
 
 
 if __name__ == "__main__":

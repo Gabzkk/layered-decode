@@ -13,7 +13,7 @@ of the beam. That is why layer priority is a tiebreak rather than a schedule.
 
 import base64
 import re
-from typing import Dict, FrozenSet, List, Optional, Tuple
+from typing import Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 from .key_requirement import identify_key_requirement
 from .models import DecodeResult, DecodeStep
@@ -190,6 +190,9 @@ class LayeredDecoder:
         detectors: Optional[List[Layer]] = None,
         beam_width: int = 3,
         flag_prefixes: Optional[Tuple[str, ...]] = None,
+        key: Optional[str] = None,
+        wordlist: Optional[Sequence[str] | str] = None,
+        bruteforce: bool = False,
     ):
         self.max_depth = max_depth
         self.min_confidence = min_confidence
@@ -204,6 +207,9 @@ class LayeredDecoder:
         self.decode_layers: List[Layer] = [
             d for d in self.detectors if not isinstance(d, StopSignal)
         ]
+        self.key = key
+        self.wordlist = wordlist
+        self.bruteforce = bruteforce
 
     # ── public API ──────────────────────────────────────────────────
 
@@ -212,9 +218,46 @@ class LayeredDecoder:
         input_string,
         forced_layers: Optional[Dict[int, str]] = None,
         allow_segmentation: bool = True,
+        key: Optional[str] = None,
+        wordlist: Optional[Sequence[str] | str] = None,
+        bruteforce: Optional[bool] = None,
     ) -> DecodeResult:
         data = _as_bytes(input_string)
         res = self._beam(data, forced_layers or {})
+
+        active_key = key if key is not None else self.key
+        active_wordlist = wordlist if wordlist is not None else self.wordlist
+        active_bruteforce = bruteforce if bruteforce is not None else self.bruteforce
+
+        if res.key_required and (active_key is not None or active_bruteforce or active_wordlist is not None):
+            from .crypto_decryptor import decrypt_envelope, bruteforce_envelope, continue_with_decrypted
+            decrypted_info = None
+            if active_key is not None:
+                dec = decrypt_envelope(res.final_bytes, res.encryption_format, active_key)
+                if dec is not None:
+                    pt, method = dec
+                    decrypted_info = (pt, active_key, method)
+            if decrypted_info is None and (active_bruteforce or active_wordlist is not None):
+                ctx_words = [s.output_value for s in res.steps]
+                bf_res = bruteforce_envelope(
+                    res.final_bytes,
+                    res.encryption_format,
+                    wordlist=active_wordlist,
+                    contextual_words=ctx_words,
+                )
+                if bf_res is not None:
+                    decrypted_info = bf_res
+
+            if decrypted_info is not None:
+                pt, used_key, method = decrypted_info
+                res = continue_with_decrypted(
+                    self,
+                    res,
+                    pt,
+                    used_key,
+                    method,
+                    allow_segmentation=allow_segmentation,
+                )
 
         if res.key_required or forced_layers or not allow_segmentation:
             return res
@@ -222,25 +265,17 @@ class LayeredDecoder:
         from .segmentation import try_segmentation_decode, detect_compound_indicators
 
         # Segmentation is a fallback for when the beam could not finish.
-        #
-        # Gating it on a compound *detector* does not work: the character-class
-        # changepoint signal is not separable in practice (a single base64
-        # payload shows the same 0.75 shift as two concatenated ones).
-        # Offering it unconditionally does not work either -- measured, it
-        # splits single payloads at coincidental boundaries, which is strictly
-        # worse than missing a compound.
-        #
-        # Known limitation: because the beam has no split operator, its best
-        # reachable state on an undelimited concatenation is whatever
-        # brute-force accident scores highest. When that accident is
-        # flag-shaped enough to pass `_is_finished`, segmentation is skipped and
-        # the compound is reported as (wrongly) solved. Pass labelled or
-        # line-separated input -- which is what the CLI does, and what
-        # labelled input files contain -- and this does not arise.
         if res.status != "solved" and len(data) >= COMPOUND_MIN_LENGTH:
             segmented = try_segmentation_decode(
                 data,
-                lambda d: self.decode(d, forced_layers=None, allow_segmentation=False),
+                lambda d: self.decode(
+                    d,
+                    forced_layers=None,
+                    allow_segmentation=False,
+                    key=active_key,
+                    wordlist=active_wordlist,
+                    bruteforce=active_bruteforce,
+                ),
                 self.decode_layers,
                 flag_prefixes=self.flag_prefixes,
             )
@@ -259,10 +294,19 @@ class LayeredDecoder:
         self,
         input_string,
         forced_layers: Optional[Dict[int, str]] = None,
+        key: Optional[str] = None,
+        wordlist: Optional[Sequence[str] | str] = None,
+        bruteforce: Optional[bool] = None,
     ) -> DecodeResult:
         """Single beam first; fall back to split strategies if it stalled."""
         data = _as_bytes(input_string)
-        base_result = self.decode(data, forced_layers)
+        base_result = self.decode(
+            data,
+            forced_layers,
+            key=key,
+            wordlist=wordlist,
+            bruteforce=bruteforce,
+        )
 
         if base_result.key_required:
             return base_result
@@ -273,7 +317,15 @@ class LayeredDecoder:
         from .branching import try_branch_decode
 
         branch_result = try_branch_decode(
-            data, lambda d: self.decode(d, forced_layers), flag_prefixes=self.flag_prefixes
+            data,
+            lambda d: self.decode(
+                d,
+                forced_layers,
+                key=key,
+                wordlist=wordlist,
+                bruteforce=bruteforce,
+            ),
+            flag_prefixes=self.flag_prefixes,
         )
         return branch_result if branch_result is not None else base_result
 
