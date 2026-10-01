@@ -1,0 +1,20 @@
+[project]
+name = "univ-layered-crypt"
+version = "1.0.0"
+description = "CTF/security layered encoding decoder"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+layered-decoder = "layered_decoder.cli:main"
+
+# Declared explicitly: setuptools' flat-layout auto-discovery treats `references`
+# (a directory of challenge data) as a top-level package and aborts with
+# "Multiple top-level packages discovered", so `pip install -e .` never worked.
+[tool.setuptools]
+packages = ["layered_decoder", "layered_decoder.detectors"]
+
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
